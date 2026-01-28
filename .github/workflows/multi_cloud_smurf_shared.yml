@@ -23,9 +23,7 @@ on:
         type: string
         default: "aws"
 
-      # ✅ Backend provider (IMPORTANT for remote state access)
-      # If your backend.tf uses AWS S3 even for Azure/GCP terraform,
-      # keep backend_provider as "aws".
+    
       backend_provider:
         required: false
         type: string

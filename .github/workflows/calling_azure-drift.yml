@@ -1,0 +1,26 @@
+name:  "Terraform Drift Check (Azure) Using Smurf"
+on:
+    workflow_dispatch:
+
+permissions:
+    id-token: write
+    contents: read
+    issues: write
+
+
+jobs:
+  calling_Smurf_workflow_tfdrift-clouddrove:
+    uses: imran-cd/multiple-ec2/.github/workflows/multi_cloud_smurf_shared.yml@main
+    with:
+        provider: azurerm
+        backend_provider: azurerm
+        terraform_version: "1.8.5"
+        smurf_version: "latest"
+        working_directory: "."
+        
+    secrets:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        
+        
