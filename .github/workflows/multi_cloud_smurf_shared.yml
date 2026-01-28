@@ -1,0 +1,303 @@
+name: "Terraform Check drift Using Smurf"
+
+on:
+  workflow_call:
+    inputs:
+      smurf_version:
+        required: false
+        default: "latest"
+        type: string
+
+      terraform_version:
+        required: false
+        default: "1.8.5"
+        type: string
+
+      working_directory:
+        required: false
+        type: string
+        default: "."
+
+      provider:
+        required: true
+        type: string
+        default: "aws"
+
+      # ✅ Backend provider (IMPORTANT for remote state access)
+      # If your backend.tf uses AWS S3 even for Azure/GCP terraform,
+      # keep backend_provider as "aws".
+      backend_provider:
+        required: false
+        type: string
+        default: "aws"
+
+      aws_region:
+        required: false
+        type: string
+        default: "us-east-2"
+
+      token_format:
+        required: false
+        type: string
+        default: "access_token"
+
+      access_token_lifetime:
+        required: false
+        type: string
+        default: "300s"
+
+      project_id:
+        required: false
+        type: string
+
+      create_credentials_file:
+        required: false
+        type: boolean
+        default: true
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+
+      # ✅ GCP supports both JSON key + OIDC (WIF)
+      GCP_CREDENTIALS:
+        required: false
+      WORKLOAD_IDENTITY_PROVIDER:
+        required: false
+      SERVICE_ACCOUNT:
+        required: false
+
+jobs:
+  drift_check:
+    name: Terraform drift check (SMURF PLAN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Smurf
+        uses: clouddrove/smurf@master
+        with:
+          version: ${{ inputs.smurf_version }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      
+      - name: Validate provider input
+        shell: bash
+        run: |
+          if [[ "${{ inputs.provider }}" != "aws" && "${{ inputs.provider }}" != "azurerm" && "${{ inputs.provider }}" != "gcp" ]]; then
+            echo "❌ Invalid provider: ${{ inputs.provider }}"
+            echo "Valid values are: aws | azurerm | gcp"
+            exit 1
+          fi
+
+      
+      - name: Configure AWS Credentials (Provider/Backend)
+        if: ${{ inputs.provider == 'aws' || inputs.backend_provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      
+      - name: Azure Login with OIDC
+        if: ${{ inputs.provider == 'azurerm' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      
+      - name: Export Azure ARM variables
+        if: ${{ inputs.provider == 'azurerm' }}
+        run: |
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+          echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+
+      
+      - name: ✅ Validate GCP auth inputs
+        if: ${{ inputs.provider == 'gcp' }}
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.GCP_CREDENTIALS }}" ] && [ -z "${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}" ]; then
+            echo "❌ GCP auth not configured."
+            echo "Provide either:"
+            echo "  - secrets.GCP_CREDENTIALS (Service Account JSON key) OR"
+            echo "  - secrets.WORKLOAD_IDENTITY_PROVIDER + secrets.SERVICE_ACCOUNT (OIDC)"
+            exit 1
+          fi
+
+      
+      - name: Authenticate to Google Cloud
+        if: ${{ inputs.provider == 'gcp' }}
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+          create_credentials_file: ${{ inputs.create_credentials_file }}
+          token_format: ${{ inputs.token_format }}
+          access_token_lifetime: ${{ inputs.access_token_lifetime }}
+          project_id: ${{ inputs.project_id }}
+
+      - name: Setup gcloud
+        if: ${{ inputs.provider == 'gcp' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: 🚀 Terraform init (Smurf)
+        run: smurf stf init
+
+      - name: 🎨 Terraform fmt (Smurf)
+        run: smurf stf fmt --timeout 10s
+
+      - name: 📡 Terraform Plan (Smurf)
+        id: smurf-plan
+        shell: bash
+        run: |
+          smurf stf plan | sed -r "s/\x1B\[[0-9;]*[mK]//g" | tee plan.txt
+
+      - name: Detect drift from SMURF plan output
+        id: drift-detect
+        shell: bash
+        run: |
+          if grep -q "No changes. Your infrastructure matches the configuration." plan.txt; then
+            echo "drift=false" >> $GITHUB_OUTPUT
+          else
+            echo "drift=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 💾 Upload Plan Report Artifact (only on drift)
+        if: ${{ steps.drift-detect.outputs.drift == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: smurf-plan-report
+          path: plan.txt
+
+      - name: Create String Output
+        id: plan-string
+        shell: bash
+        run: |
+          PLAN_OUTPUT="$(cat plan.txt)"
+          delimiter="$(openssl rand -hex 8)"
+
+          echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+          echo "## Terraform Plan Output" >> $GITHUB_OUTPUT
+          echo "### Working Directory: \`${{ inputs.working_directory }}\`" >> $GITHUB_OUTPUT
+          echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo '```terraform' >> $GITHUB_OUTPUT
+          echo "$PLAN_OUTPUT" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "</details>" >> $GITHUB_OUTPUT
+          echo "${delimiter}" >> $GITHUB_OUTPUT
+
+      - name: 📝 Publish Terraform Plan to Task Summary
+        env:
+          SUMMARY: ${{ steps.plan-string.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🚨 Publish Drift Report and create/update issue
+        if: steps.drift-detect.outputs.drift == 'true'
+        uses: actions/github-script@v8
+        env:
+          SUMMARY: "${{ steps.plan-string.outputs.summary }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = `${process.env.SUMMARY}`;
+            const title = 'Terraform Configuration Drift Detected (SMURF PLAN)';
+            const creator = 'github-actions[bot]'
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            })
+
+            const driftIssues = issues.data.filter(
+              (i) => i.title === title && i.user.login === creator
+            )
+
+            if (driftIssues.length > 0) {
+              const issue = driftIssues[0]
+              console.log('Drift Detected: Updating existing issue')
+
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: body
+              })
+            } else {
+              console.log('Drift Detected: Creating new issue')
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['terraform', 'drift']
+              })
+            }
+
+      - name: Publish Drift Report (close issue if resolved)
+        if: steps.drift-detect.outputs.drift == 'false'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const title = 'Terraform Configuration Drift Detected (SMURF PLAN)';
+            const creator = 'github-actions[bot]'
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            })
+
+            const driftIssues = issues.data.filter(
+              (i) => i.title === title && i.user.login === creator
+            )
+
+            if (driftIssues.length > 0) {
+              const issue = driftIssues[0]
+
+              console.log('No Drift: Closing drift issue')
+
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              })
