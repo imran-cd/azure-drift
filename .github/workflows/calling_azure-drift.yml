@@ -13,7 +13,6 @@ jobs:
     uses: imran-cd/multiple-ec2/.github/workflows/shared_updated_smurf.yml@main
     with:
         provider: azurerm
-        backend_provider: azurerm
         terraform_version: "1.8.5"
         smurf_version: "latest"
         working_directory: "."
